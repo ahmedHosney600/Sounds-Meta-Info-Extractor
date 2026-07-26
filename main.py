@@ -168,15 +168,16 @@ def main() -> None:
           f"({len(all_results)} already done)")
 
     # ── Step 3: Google Drive API setup ────────────────────────────────────────
+    # NOTE: Do NOT call colab_auth.authenticate_user() here.
+    # main.py is executed as a subprocess (!python main.py) from the Colab
+    # notebook. authenticate_user() requires an active IPython kernel and will
+    # crash with AttributeError in subprocess mode.
+    # Drive credentials are already in place from the drive.mount() call in
+    # the Colab launcher notebook — google.auth.default() picks them up
+    # automatically via Application Default Credentials (ADC).
     drive_id_map: dict | None = None
     if config.DRIVE_FOLDER_ID:
         print("\n🔗  Querying Google Drive API for file IDs…")
-        try:
-            from google.colab import auth as colab_auth
-            colab_auth.authenticate_user()
-        except ImportError:
-            pass  # not on Colab — use already-authenticated service if available
-
         try:
             from googleapiclient.discovery import build
             import google.auth
@@ -190,7 +191,7 @@ def main() -> None:
             print(f"⚠️   Drive API setup failed ({exc}) — Drive links will be empty")
     else:
         print("\n⚠️   DRIVE_FOLDER_ID not set — Drive links will be empty")
-        print("    Set it in config.py or via environment variable to enable them")
+        print("    Set it via DRIVE_FOLDER_ID env variable in Colab Cell 3 to enable them")
 
     # ── Step 4: Load YAMNet ───────────────────────────────────────────────────
     print()
