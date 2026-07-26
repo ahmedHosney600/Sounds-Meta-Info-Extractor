@@ -8,29 +8,21 @@ On Google Colab, the Colab launcher notebook sets these for you.
 import os
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-# Full path to your sounds folder on Google Drive (as mounted in Colab)
-# Example: "/content/drive/MyDrive/Sound Libraries/BLOW"
 SOUNDS_FOLDER: str = os.environ.get(
     "SOUNDS_FOLDER",
     "/content/drive/MyDrive/SOUNDS"
 )
 
-# Google Drive Folder ID — found in the browser URL when you open the folder:
-# https://drive.google.com/drive/folders/<FOLDER_ID>
-# Set to None or leave empty to skip Drive link generation.
 DRIVE_FOLDER_ID: str | None = os.environ.get("DRIVE_FOLDER_ID") or None
 
-# Output directory (created automatically if it doesn't exist)
 OUTPUT_FOLDER: str = os.environ.get(
     "OUTPUT_FOLDER",
     "/content/drive/MyDrive/sounds_metadata_output"
 )
 
 # ── Scan Settings ──────────────────────────────────────────────────────────────
-# Search inside subfolders recursively?
 RECURSIVE: bool = os.environ.get("RECURSIVE", "true").lower() == "true"
 
-# Supported audio file extensions (all lowercase)
 AUDIO_EXTENSIONS: set = {
     ".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif",
     ".m4a", ".opus", ".wma", ".caf", ".aac",
@@ -52,6 +44,23 @@ N_MFCC: int = int(os.environ.get("N_MFCC", "20"))
 
 # Number of top YAMNet predictions to keep per file
 YAMNET_TOP_K: int = 5
+
+# ── Performance ───────────────────────────────────────────────────────────────
+# Number of parallel worker threads for file processing.
+# Each worker loads audio + runs librosa on CPU concurrently.
+# YAMNet (GPU) is called from the main thread and is thread-safe in TF2.
+# Recommended: 2–4 on Colab. Higher values help when Drive I/O is the bottleneck.
+NUM_WORKERS: int = int(os.environ.get("NUM_WORKERS", "3"))
+
+# Save checkpoint every N files (increase for speed, decrease for safety)
+CHECKPOINT_EVERY: int = int(os.environ.get("CHECKPOINT_EVERY", "25"))
+
+# Path to pre-built Drive ID map JSON (built interactively in Colab Cell 3b)
+# Set to empty/None to skip Drive links.
+DRIVE_ID_MAP_FILE: str = os.environ.get(
+    "DRIVE_ID_MAP_FILE",
+    "/content/drive_id_map.json"
+)
 
 # ── Output File Paths (derived from OUTPUT_FOLDER) ────────────────────────────
 CHECKPOINT_FILE: str = os.path.join(OUTPUT_FOLDER, "checkpoint.json")

@@ -1,4 +1,8 @@
-"""extractors/librosa_features.py — Full spectral & acoustic feature extraction."""
+"""extractors/librosa_features.py — Full spectral & acoustic feature extraction.
+
+Accepts either a filepath (loads audio internally) or pre-loaded audio
+(y, sr) to avoid re-reading files already loaded by the caller.
+"""
 
 import warnings
 import numpy as np
@@ -10,12 +14,23 @@ warnings.filterwarnings("ignore")
 
 
 def get_librosa_features(
-    filepath: str,
+    filepath: str | None = None,
+    *,
+    y: np.ndarray | None = None,
     sr: int | None = None,
     n_mfcc: int | None = None,
 ) -> dict:
     """
     Extract comprehensive audio features using librosa.
+
+    Parameters
+    ----------
+    filepath : Path to audio file. Used only when ``y`` is not supplied.
+    y        : Pre-loaded mono waveform (numpy float32 array). When provided,
+               ``filepath`` is ignored and no file I/O occurs.
+    sr       : Sample rate of ``y``, or target resample rate when loading from
+               ``filepath``. Defaults to ``config.LIBROSA_SR``.
+    n_mfcc   : Number of MFCC coefficients. Defaults to ``config.N_MFCC``.
 
     Feature groups
     --------------
@@ -28,15 +43,7 @@ def get_librosa_features(
     Rhythm     : tempo (BPM), beat count
     Onsets     : count, rate per second, timestamp list
     Chroma     : 12-note energy vectors + dominant note
-    Tonnetz    : 6-dim tonal centroid
     MFCCs      : mean + std for each of N_MFCC coefficients (also flat columns)
-    Poly       : linear spectral trend coefficients
-
-    Parameters
-    ----------
-    filepath : Path to the audio file.
-    sr       : Analysis sample rate (default: config.LIBROSA_SR).
-    n_mfcc   : Number of MFCCs (default: config.N_MFCC).
     """
     if sr is None:
         sr = config.LIBROSA_SR
@@ -45,8 +52,16 @@ def get_librosa_features(
 
     r: dict = {}
     try:
-        # librosa.load uses soundfile + audioread (ffmpeg) — handles all formats
-        y, loaded_sr = librosa.load(filepath, sr=sr, mono=True, res_type="kaiser_fast")
+        # ── Audio load (skipped if caller already loaded) ─────────────────────
+        if y is None:
+            if filepath is None:
+                raise ValueError("Either filepath or y must be provided")
+            y, loaded_sr = librosa.load(
+                filepath, sr=sr, mono=True, res_type="kaiser_fast"
+            )
+        else:
+            loaded_sr = sr  # caller guarantees this
+
         dur = librosa.get_duration(y=y, sr=loaded_sr)
 
         r["lb_loaded_sr"]         = int(loaded_sr)
@@ -133,31 +148,16 @@ def get_librosa_features(
         r["lb_chroma_dominant_note"] = NOTES[int(np.argmax(chroma_m))]
         r["lb_chroma_second_note"]   = NOTES[int(np.argsort(chroma_m)[-2])]
 
-        # ── Tonnetz (tonal centroid features, 6-dim) ───────────────────────────
-        try:
-            tn = librosa.feature.tonnetz(y=librosa.effects.harmonic(y), sr=loaded_sr)
-            r["lb_tonnetz_mean"] = [round(float(v), 6) for v in np.mean(tn, axis=1)]
-        except Exception:
-            r["lb_tonnetz_mean"] = None
-
         # ── MFCCs ──────────────────────────────────────────────────────────────
         mfccs  = librosa.feature.mfcc(y=y, sr=loaded_sr, n_mfcc=n_mfcc)
         mfcc_m = np.mean(mfccs, axis=1)
         mfcc_s = np.std(mfccs, axis=1)
         r["lb_mfcc_mean"] = [round(float(v), 4) for v in mfcc_m]
         r["lb_mfcc_std"]  = [round(float(v), 4) for v in mfcc_s]
-        # Flat individual columns (easier for CSV-based filtering in the web app)
+        # Individual flat columns for CSV filtering
         for i in range(n_mfcc):
             r[f"lb_mfcc_{i + 1:02d}_mean"] = round(float(mfcc_m[i]), 4)
             r[f"lb_mfcc_{i + 1:02d}_std"]  = round(float(mfcc_s[i]), 4)
-
-        # ── Polynomial spectral features (linear trend) ────────────────────────
-        try:
-            poly = librosa.feature.poly_features(y=y, sr=loaded_sr, order=1)
-            r["lb_poly_coeff_0_mean"] = round(float(np.mean(poly[0])), 6)
-            r["lb_poly_coeff_1_mean"] = round(float(np.mean(poly[1])), 6)
-        except Exception:
-            pass
 
     except Exception as exc:
         r["lb_error"] = str(exc)

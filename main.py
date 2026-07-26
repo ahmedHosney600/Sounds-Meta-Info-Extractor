@@ -3,27 +3,6 @@
 main.py — Sound Metadata Extractor
 ===================================
 Entry point for the Sound Meta Extractor project.
-
-Usage (on Colab or any Linux machine)
---------------------------------------
-    # Basic run (edit config.py first):
-    python main.py
-
-    # Override paths via environment variables (used by run_on_colab.ipynb):
-    SOUNDS_FOLDER="/content/drive/MyDrive/SOUNDS" \\
-    DRIVE_FOLDER_ID="1AbCdEfGhIj..." \\
-    OUTPUT_FOLDER="/content/drive/MyDrive/output" \\
-    python main.py
-
-The script:
-    1. Discovers all audio files in SOUNDS_FOLDER
-    2. Loads a checkpoint (resumes from where it left off if interrupted)
-    3. Queries Google Drive API for file IDs (if DRIVE_FOLDER_ID is set)
-    4. Loads the YAMNet AI model
-    5. Iterates every file, extracting all metadata
-    6. Saves checkpoint every 10 files
-    7. Writes sounds.json, sounds.csv, sounds.xlsx, extraction_log.txt to OUTPUT_FOLDER
-    8. Prints a summary
 """
 
 import os
@@ -32,12 +11,14 @@ import json
 import traceback
 from collections import Counter
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # ── make sure the project root is on sys.path ─────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import librosa
 from tqdm import tqdm
 
 import config
@@ -50,8 +31,18 @@ from extractors.audio_technical import get_audio_technical
 from extractors.librosa_features import get_librosa_features
 from extractors.mutagen_tags import get_embedded_tags
 from extractors.yamnet_classifier import YAMNetClassifier
-from extractors.drive_links import build_drive_id_map, get_drive_links
+from extractors.drive_links import get_drive_links
 from extractors.heuristics import compute_heuristics
+
+
+# ── Global YAMNet instance (loaded once per process if using multiprocessing) ──
+_yamnet = None
+
+def _get_yamnet():
+    global _yamnet
+    if _yamnet is None:
+        _yamnet = YAMNetClassifier()
+    return _yamnet
 
 
 # ── Per-file extraction ────────────────────────────────────────────────────────
@@ -59,13 +50,10 @@ from extractors.heuristics import compute_heuristics
 def extract_all_metadata(
     filepath: str,
     drive_id_map: dict | None,
-    yamnet: YAMNetClassifier,
 ) -> dict:
     """
     Run every extractor on *filepath* and merge results into a single flat dict.
-
-    On a per-extractor failure the error is recorded in ``_errors`` and
-    extraction continues — partial data is always better than nothing.
+    This runs in a worker process.
     """
     meta: dict = {"_status": "ok", "_errors": {}}
     lb: dict   = {}
@@ -83,7 +71,6 @@ def extract_all_metadata(
     # 2 ── Smart filename parsing ───────────────────────────────────────────────
     try:
         fn_parsed = parse_filename(filepath)
-        # prefix every key with fn_ so they're grouped in the CSV
         meta.update({f"fn_{k}": v for k, v in fn_parsed.items()})
     except Exception as exc:
         meta["_errors"]["filename_parse"] = str(exc)
@@ -94,33 +81,46 @@ def extract_all_metadata(
     except Exception as exc:
         meta["_errors"]["soundfile"] = str(exc)
 
-    # 4 ── Spectral & acoustic features (librosa) ──────────────────────────────
-    try:
-        lb = get_librosa_features(filepath)
-        meta.update(lb)
-    except Exception as exc:
-        meta["_errors"]["librosa"] = str(exc)
-
-    # 5 ── Embedded tags (mutagen) ─────────────────────────────────────────────
+    # 4 ── Embedded tags (mutagen) ─────────────────────────────────────────────
     try:
         meta.update(get_embedded_tags(filepath))
     except Exception as exc:
         meta["_errors"]["mutagen"] = str(exc)
 
-    # 6 ── YAMNet AI classification ────────────────────────────────────────────
+    # 5 ── Audio Feature Extraction & AI Classification ────────────────────────
+    # Optimize: load audio once at 22050 Hz (for librosa), then resample for YAMNet
     try:
-        ai = yamnet.classify(filepath)
-        meta.update(ai)
-    except Exception as exc:
-        meta["_errors"]["yamnet"] = str(exc)
+        # Load for librosa
+        y, sr = librosa.load(filepath, sr=config.LIBROSA_SR, mono=True, res_type="kaiser_fast")
+        
+        try:
+            lb = get_librosa_features(y=y, sr=sr, n_mfcc=config.N_MFCC)
+            meta.update(lb)
+        except Exception as exc:
+            meta["_errors"]["librosa"] = str(exc)
 
-    # 7 ── Google Drive links ──────────────────────────────────────────────────
+        # Resample for YAMNet (16000 Hz)
+        try:
+            yamnet = _get_yamnet()
+            if sr != config.YAMNET_SR:
+                y_yamnet = librosa.resample(y, orig_sr=sr, target_sr=config.YAMNET_SR, res_type="kaiser_fast")
+            else:
+                y_yamnet = y
+            ai = yamnet.classify(y=y_yamnet)
+            meta.update(ai)
+        except Exception as exc:
+            meta["_errors"]["yamnet"] = str(exc)
+
+    except Exception as exc:
+        meta["_errors"]["audio_load"] = str(exc)
+
+    # 6 ── Google Drive links ──────────────────────────────────────────────────
     try:
         meta.update(get_drive_links(meta.get("filename", ""), drive_id_map))
     except Exception as exc:
         meta["_errors"]["drive_links"] = str(exc)
 
-    # 8 ── Heuristics (derived flags) ──────────────────────────────────────────
+    # 7 ── Heuristics (derived flags) ──────────────────────────────────────────
     try:
         meta.update(compute_heuristics(lb, ai, fn_parsed))
     except Exception as exc:
@@ -136,13 +136,14 @@ def extract_all_metadata(
 
 def main() -> None:
     print("=" * 68)
-    print("🎵  Sound Metadata Extractor")
+    print("🎵  Sound Metadata Extractor (Optimized)")
     print("=" * 68)
     print(f"   Sounds folder  : {config.SOUNDS_FOLDER}")
     print(f"   Output folder  : {config.OUTPUT_FOLDER}")
     print(f"   Recursive scan : {config.RECURSIVE}")
     print(f"   Max file size  : {config.MAX_FILE_SIZE_MB} MB")
     print(f"   MFCC count     : {config.N_MFCC}")
+    print(f"   Workers        : {config.NUM_WORKERS}")
     print()
 
     os.makedirs(config.OUTPUT_FOLDER, exist_ok=True)
@@ -167,59 +168,55 @@ def main() -> None:
     print(f"\n📦  {len(to_process)} new files to process "
           f"({len(all_results)} already done)")
 
-    # ── Step 3: Google Drive API setup ────────────────────────────────────────
-    # NOTE: Do NOT call colab_auth.authenticate_user() here.
-    # main.py is executed as a subprocess (!python main.py) from the Colab
-    # notebook. authenticate_user() requires an active IPython kernel and will
-    # crash with AttributeError in subprocess mode.
-    # Drive credentials are already in place from the drive.mount() call in
-    # the Colab launcher notebook — google.auth.default() picks them up
-    # automatically via Application Default Credentials (ADC).
-    drive_id_map: dict | None = None
-    if config.DRIVE_FOLDER_ID:
-        print("\n🔗  Querying Google Drive API for file IDs…")
+    # ── Step 3: Load Drive ID Map ─────────────────────────────────────────────
+    drive_id_map = None
+    if config.DRIVE_ID_MAP_FILE and os.path.exists(config.DRIVE_ID_MAP_FILE):
+        print(f"\n🔗  Loading Drive ID map from {config.DRIVE_ID_MAP_FILE}...")
         try:
-            from googleapiclient.discovery import build
-            import google.auth
-            creds, _ = google.auth.default()
-            drive_service = build("drive", "v3", credentials=creds)
-            drive_id_map  = build_drive_id_map(
-                config.DRIVE_FOLDER_ID, drive_service, recursive=config.RECURSIVE
-            )
-            print(f"✅  Mapped {len(drive_id_map)} files to Drive IDs")
+            with open(config.DRIVE_ID_MAP_FILE, "r") as f:
+                drive_id_map = json.load(f)
+            print(f"✅  Loaded {len(drive_id_map)} Drive IDs.")
         except Exception as exc:
-            print(f"⚠️   Drive API setup failed ({exc}) — Drive links will be empty")
+            print(f"⚠️   Could not load Drive ID map: {exc}")
     else:
-        print("\n⚠️   DRIVE_FOLDER_ID not set — Drive links will be empty")
-        print("    Set it via DRIVE_FOLDER_ID env variable in Colab Cell 3 to enable them")
+        print("\n⚠️   No Drive ID map found. Drive links will be empty.")
+        print("    Run the 'Generate Drive ID Map' cell in the notebook to enable links.")
 
-    # ── Step 4: Load YAMNet ───────────────────────────────────────────────────
-    print()
-    yamnet = YAMNetClassifier()
-    print()
-
-    # ── Step 5: Main extraction loop ─────────────────────────────────────────
+    # ── Step 4: Main extraction loop (Multiprocessing) ───────────────────────
     fatal_errors: list[dict] = []
+    
+    if not to_process:
+        print("\n✅  All files already processed!")
+    else:
+        print(f"\n🚀  Starting extraction with {config.NUM_WORKERS} workers...")
+        
+        with ProcessPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
+            futures = {
+                executor.submit(extract_all_metadata, filepath, drive_id_map): filepath
+                for filepath in to_process
+            }
+            
+            with tqdm(total=len(to_process), desc="Extracting metadata", unit="file") as pbar:
+                for future in as_completed(futures):
+                    filepath = futures[future]
+                    fname = Path(filepath).name
+                    try:
+                        result = future.result()
+                        all_results.append(result)
+                        processed_names.add(fname)
+                        checkpoint[fname] = result
+                        
+                        if len(all_results) % config.CHECKPOINT_EVERY == 0:
+                            save_checkpoint(checkpoint, config.CHECKPOINT_FILE)
+                    except Exception as exc:
+                        tb = traceback.format_exc()
+                        fatal_errors.append({"file": filepath, "error": str(exc), "traceback": tb})
+                        tqdm.write(f"❌  FATAL: {fname} → {exc}")
+                    
+                    pbar.update(1)
 
-    for filepath in tqdm(to_process, desc="Extracting metadata", unit="file"):
-        fname = Path(filepath).name
-        try:
-            result = extract_all_metadata(filepath, drive_id_map, yamnet)
-            all_results.append(result)
-            processed_names.add(fname)
-            checkpoint[fname] = result
-
-            # Checkpoint every 10 files so a crash loses at most 10 files
-            if len(all_results) % 10 == 0:
-                save_checkpoint(checkpoint, config.CHECKPOINT_FILE)
-
-        except Exception as exc:
-            tb = traceback.format_exc()
-            fatal_errors.append({"file": filepath, "error": str(exc), "traceback": tb})
-            tqdm.write(f"❌  FATAL: {fname} → {exc}")
-
-    # Final checkpoint
-    save_checkpoint(checkpoint, config.CHECKPOINT_FILE)
+        # Final checkpoint
+        save_checkpoint(checkpoint, config.CHECKPOINT_FILE)
 
     partial = sum(1 for r in all_results if r.get("_errors"))
     print(f"\n✅  Extraction complete!")
@@ -227,18 +224,16 @@ def main() -> None:
     print(f"    Partial errors   : {partial}  (some fields missing)")
     print(f"    Fatal errors     : {len(fatal_errors)}  (file skipped entirely)")
 
-    # ── Step 6: Save outputs ──────────────────────────────────────────────────
+    # ── Step 5: Save outputs ──────────────────────────────────────────────────
     print("\n💾  Saving outputs…")
     save_outputs(all_results, fatal_errors)
 
-    # ── Step 7: Summary ───────────────────────────────────────────────────────
+    # ── Step 6: Summary ───────────────────────────────────────────────────────
     _print_summary(all_results)
 
 
 def _print_summary(results: list[dict]) -> None:
     """Print extraction statistics to stdout."""
-    import pandas as pd
-
     if not results:
         return
 
